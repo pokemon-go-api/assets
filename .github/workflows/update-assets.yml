@@ -28,7 +28,7 @@ jobs:
           BASE: ${{ secrets.API_BASE_URL }}
           QUERY: ${{ secrets.API_QUERY_LATEST }}
         run: |
-          TS=$(curl -s "$BASE$QUERY" | jq -r '.items[0].timestamp')
+          TS=$(curl -s "$BASE$QUERY" | jq -r '.items[0].timestamp' | head -n1)
           echo "timestamp<<EOF" >> $GITHUB_OUTPUT
           echo "$TS" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
