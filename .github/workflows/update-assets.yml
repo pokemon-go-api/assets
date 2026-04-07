@@ -1,0 +1,147 @@
+name: Update Pokemon Assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_deletion_ratio:
+        description: "Max allowed deletion ratio (e.g. 0.2 = 10%)"
+        required: false
+        default: "0.1"
+
+  schedule:
+    - cron: "0 3 * * *"  # once a day at 03:00 UTC
+
+jobs:
+  update-assets:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Get latest remote timestamp
+        id: remote
+        env:
+          BASE: ${{ secrets.API_BASE_URL }}
+          QUERY: ${{ secrets.API_QUERY_LATEST }}
+        run: |
+          TS=$(curl -s "$BASE$QUERY" | jq -r '.items[0].timestamp')
+          echo "timestamp<<EOF" >> $GITHUB_OUTPUT
+          echo "$TS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Read local timestamp
+        id: local
+        run: |
+          if [ -f .last_updated_pokemon_images ]; then
+            TS=$(cat .last_updated_pokemon_images)
+          else
+            TS="1970-01-01T00:00:00Z"
+          fi
+          echo "timestamp<<EOF" >> $GITHUB_OUTPUT
+          echo "$TS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Compare timestamps
+        id: compare
+        run: |
+          if [[ "${{ steps.remote.outputs.timestamp }}" > "${{ steps.local.outputs.timestamp }}" ]]; then
+            echo "update=true" >> $GITHUB_OUTPUT
+          else
+            echo "update=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Stop if no update needed
+        if: steps.compare.outputs.update == 'false'
+        run: echo "No update needed"
+
+      - name: Fetch all assets
+        if: steps.compare.outputs.update == 'true'
+        env:
+          BASE: ${{ secrets.API_BASE_URL }}
+          QUERY: ${{ secrets.API_QUERY_ALL }}
+        run: |
+          curl -s "$BASE$QUERY" > assets.json
+
+      - name: Extract + filter + deduplicate
+        if: steps.compare.outputs.update == 'true'
+        run: |
+          jq -r '
+            .items
+            | map(select(.type=="image"))
+            | map(select(.name | test("^pm\\d{1,4}.*\\.icon\\.png$")))
+            | reduce .[] as $item ({}; .[$item.name] //= $item)
+            | .[]
+            | "\(.name) \(.url) \(.hash)"
+          ' assets.json > download.txt
+
+      - name: Prepare folder
+        if: steps.compare.outputs.update == 'true'
+        run: |
+          mkdir -p Pokemon
+
+      - name: Download new/missing/corrupted images
+        if: steps.compare.outputs.update == 'true'
+        run: |
+          cat download.txt | xargs -n 3 -P 12 bash -c '
+          name="$0"
+          url="$1"
+          expected="$2"
+          file="Pokemon/$name"
+
+          if [ -f "$file" ]; then
+            actual=$(sha256sum "$file" | awk "{print \$1}")
+            if [ "$actual" = "$expected" ]; then
+              exit 0
+            else
+              echo "↻ RE-DOWNLOAD (hash mismatch) $name"
+            fi
+          else
+            echo "⬇ NEW $name"
+          fi
+
+          curl -s -L --retry 5 "$url" -o "$file"
+          '
+
+      - name: Safety check (deletion ratio)
+        if: steps.compare.outputs.update == 'true'
+        run: |
+          EXPECTED=$(wc -l < download.txt)
+          ACTUAL=$(find Pokemon -type f | wc -l)
+          echo "Expected files: $EXPECTED"
+          echo "Actual files: $ACTUAL"
+
+          if [ "$EXPECTED" -gt 0 ]; then
+            DIFF=$(awk "BEGIN {print ($EXPECTED - $ACTUAL)/$EXPECTED}")
+          else
+            DIFF=0
+          fi
+
+          echo "Deletion ratio: $DIFF"
+
+          MAX=${{ github.event.inputs.max_deletion_ratio || '0.1' }}
+
+          awk "BEGIN {exit !($DIFF <= $MAX)}" || {
+            echo "❌ Too many missing files!"
+            exit 1
+          }
+
+      - name: Save timestamp
+        if: steps.compare.outputs.update == 'true'
+        run: echo "${{ steps.remote.outputs.timestamp }}" > .last_updated_pokemon_images
+
+      - name: Cleanup
+        if: steps.compare.outputs.update == 'true'
+        run: |
+          rm -f assets.json
+          rm -f download.txt
+
+      - name: Commit & Push
+        if: steps.compare.outputs.update == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update Pokemon assets"
+          branch: main
